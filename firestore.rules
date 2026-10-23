@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// 구름닷컴 Firestore 보안 규칙
+// - 초대코드(config/invite 문서의 code)를 맞힌 기기만 글을 읽고 쓸 수 있다.
+// - 관리자 코드(config/admin 문서의 code)를 맞힌 기기는 공지·반 정보·남의 글 삭제가 가능하다.
+// - config 문서는 아무도 읽을 수 없고, 규칙만 비교에 쓴다. 그래서 코드가 사이트 소스에 드러나지 않는다.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(me())); }
+    function isMember() { return signedIn() && (isAdmin() || exists(/databases/$(database)/documents/members/$(me()))); }
+    function textOk(v, max) { return v is string && v.size() > 0 && v.size() <= max; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // 코드 보관함: 콘솔에서만 만들고 고친다
+    match /config/{id} {
+      allow read, write: if false;
+    }
+
+    // 초대코드를 맞히면 자기 자리를 만들 수 있다
+    match /members/{uid} {
+      allow read: if signedIn() && me() == uid;
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code == get(/databases/$(database)/documents/config/invite).data.code;
+    }
+
+    // 관리자 코드를 맞히면 관리자가 된다
+    match /admins/{uid} {
+      allow read: if signedIn() && me() == uid;
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code == get(/databases/$(database)/documents/config/admin).data.code;
+    }
+
+    match /settings/class {
+      allow read: if isMember();
+      allow write: if isAdmin()
+        && request.resource.data.keys().hasOnly(['name', 'motto'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 20
+        && request.resource.data.motto is string && request.resource.data.motto.size() <= 40;
+    }
+
+    match /posts/{pid} {
+      function validPost(d) {
+        return d.cat in ['notice', 'hw', 'free', 'qa']
+          && textOk(d.title, 80) && textOk(d.body, 5000) && textOk(d.nick, 12)
+          && (d.cat != 'notice' || isAdmin());
+      }
+
+      allow read: if isMember();
+
+      allow create: if isMember()
+        && request.resource.data.keys().hasOnly(['cat', 'title', 'body', 'nick', 'authorId', 'createdAt', 'likes'])
+        && validPost(request.resource.data)
+        && request.resource.data.authorId == me()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.likes == {};
+
+      // 글쓴이는 말머리·제목·내용을 고칠 수 있다
+      allow update: if isMember() && resource.data.authorId == me()
+        && changedOnly(['cat', 'title', 'body', 'editedAt'])
+        && validPost(request.resource.data)
+        && request.resource.data.editedAt == request.time;
+
+      // 누구나 자기 공감만 누르거나 취소할 수 있다
+      allow update: if isMember()
+        && changedOnly(['likes'])
+        && request.resource.data.likes.diff(resource.data.likes).affectedKeys().hasOnly([me()])
+        && request.resource.data.likes[me()] is bool;
+
+      allow delete: if isMember() && (resource.data.authorId == me() || isAdmin());
+
+      match /comments/{cid} {
+        allow create: if isMember()
+          && exists(/databases/$(database)/documents/posts/$(pid))
+          && request.resource.data.keys().hasOnly(['postId', 'nick', 'body', 'authorId', 'createdAt'])
+          && request.resource.data.postId == pid
+          && request.resource.data.authorId == me()
+          && textOk(request.resource.data.nick, 12)
+          && textOk(request.resource.data.body, 1000)
+          && request.resource.data.createdAt == request.time;
+
+        // 댓글 쓴 사람, 글쓴이, 관리자가 지울 수 있다
+        allow delete: if isMember() && (
+          resource.data.authorId == me()
+          || isAdmin()
+          || get(/databases/$(database)/documents/posts/$(pid)).data.authorId == me()
+        );
+      }
+    }
+
+    // 목록 화면이 모든 댓글을 한 번에 읽는다(collectionGroup)
+    match /{path=**}/comments/{cid} {
+      allow read: if isMember();
+    }
+  }
+}
