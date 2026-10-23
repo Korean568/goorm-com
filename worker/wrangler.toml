@@ -1,0 +1,10 @@
+name = "goorm-com-api"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# 비밀값(INVITE_CODE, ADMIN_CODE)은 여기 적지 않고 `wrangler secret put`으로 넣는다.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "goorm-db"
+database_id = "d54ce68d-d2c4-4d69-a609-238aef8a83b8"

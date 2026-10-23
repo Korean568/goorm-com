@@ -1,1 +1,4 @@
 .claude/
+.admin-code.txt
+worker/.wrangler/
+node_modules/

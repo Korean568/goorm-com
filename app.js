@@ -1,5 +1,4 @@
 (() => {
-  const FIREBASE_VERSION = "10.12.2";
   const CATS = [
     { key: "notice", label: "공지" },
     { key: "hw", label: "과제" },
@@ -76,8 +75,9 @@
         authorId: str(p.authorId, 200),
         createdAt: typeof p.createdAt === "number" ? p.createdAt : 0,
         editedAt: typeof p.editedAt === "number" ? p.editedAt : 0,
-        likeCount: Object.values(likes).filter((v) => v === true).length,
-        liked: likes[S.meId] === true,
+        // 서버는 공감 수와 내 공감 여부를 바로 주고, 연습 모드는 likes 목록에서 센다
+        likeCount: typeof p.likeCount === "number" ? p.likeCount : Object.values(likes).filter((v) => v === true).length,
+        liked: typeof p.liked === "boolean" ? p.liked : likes[S.meId] === true,
         comments: (byPost[p.id] || []).sort((a, b) => a.createdAt - b.createdAt),
       };
     }).sort((a, b) => b.createdAt - a.createdAt);
@@ -85,7 +85,7 @@
   const isMine = (p) => !!p.authorId && p.authorId === S.meId;
 
   // ---------- 저장소 1: 이 기기(localStorage) 연습 모드 ----------
-  // 연습 모드에서만 쓰는 초대코드 확인값(SHA-256). 공유 모드에서는 Firestore 보안 규칙이 코드를 확인한다.
+  // 연습 모드에서만 쓰는 초대코드 확인값(SHA-256). 공유 모드에서는 Worker가 서버에서 코드를 확인한다.
   const LOCAL_INVITE_HASH = "9514bda5f1da3a11c1ec2b4d40252bcc327a89cc4cc0f01f673048a551333d08";
   async function sha256(text) {
     if (!(window.crypto && crypto.subtle)) return "";
@@ -141,79 +141,96 @@
     };
   }
 
-  // ---------- 저장소 2: Firebase(Firestore) 공유 모드 ----------
-  async function firebaseStore(cfg) {
-    const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VERSION}/`;
-    const [{ initializeApp }, { getAuth, signInAnonymously }, fs] = await Promise.all([
-      import(base + "firebase-app.js"),
-      import(base + "firebase-auth.js"),
-      import(base + "firebase-firestore.js"),
-    ]);
-    const app = initializeApp(cfg);
-    const db = fs.getFirestore(app);
-    const { user } = await signInAnonymously(getAuth(app));
-    const me = user.uid;
-    let admin = false, member = false;
-    try { admin = (await fs.getDoc(fs.doc(db, "admins", me))).exists(); } catch (e) {}
-    try { member = admin || (await fs.getDoc(fs.doc(db, "members", me))).exists(); } catch (e) {}
+  // ---------- 저장소 2: Cloudflare Worker API 공유 모드 ----------
+  // 초대코드를 맞히면 받은 토큰을 이 기기에 저장해 두고, 모든 요청에 붙인다.
+  async function apiStore(base) {
+    base = base.replace(/\/+$/, "");
+    let token = LS.get("goorm.token", null);
+    async function call(method, path, data) {
+      let res;
+      try {
+        res = await fetch(base + path, {
+          method,
+          headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) },
+          body: data === undefined ? undefined : JSON.stringify(data),
+        });
+      } catch (e) {
+        throw { code: "unavailable" };
+      }
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const code = { 401: "unauthenticated", 403: "permission-denied", 404: "not-found", 429: "rate-limited", 400: "invalid" }[res.status] || "server";
+        throw { code, message: out.error, status: res.status };
+      }
+      return out;
+    }
 
-    const ms = (v) => (v && typeof v.toMillis === "function" ? v.toMillis() : typeof v === "number" ? v : 0);
-    const read = (d) => {
-      const x = d.data({ serverTimestamps: "estimate" });
-      return { ...x, id: d.id, createdAt: ms(x.createdAt), editedAt: ms(x.editedAt) };
-    };
-    const postsCol = fs.collection(db, "posts");
+    let me = null;
+    if (token) {
+      try { me = await call("GET", "/api/me"); }
+      catch (e) {
+        if (e.code !== "unauthenticated") throw e;
+        token = null;
+        LS.set("goorm.token", null);
+      }
+    }
+
+    // 다른 친구가 쓴 글이 보이도록 몇 초마다 새로 불러온다
+    const subs = { posts: [], comments: [], settings: [], err: null };
+    let loaded = false, polling = false;
+    async function refresh() {
+      try {
+        const b = await call("GET", "/api/board");
+        loaded = true;
+        subs.settings.forEach((cb) => cb(b.settings || {}));
+        subs.comments.forEach((cb) => cb(b.comments || []));
+        subs.posts.forEach((cb) => cb(b.posts || []));
+      } catch (e) {
+        if (e.code === "unauthenticated") { LS.set("goorm.token", null); location.reload(); return; }
+        if (!loaded && subs.err) subs.err(e);
+      }
+    }
+    function startPolling() {
+      if (polling) return;
+      polling = true;
+      setTimeout(refresh, 0);
+      setInterval(() => { if (!document.hidden) refresh(); }, 8000);
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+    }
+    const write = async (method, path, data) => { const r = await call(method, path, data); await refresh(); return r; };
+
     const store = {
-      mode: "cloud", uid: me, admin, member,
+      mode: "cloud", uid: me && me.userId, admin: !!(me && me.admin), member: !!me,
       async join(code) {
         try {
-          await fs.setDoc(fs.doc(db, "members", me), { code });
+          const r = await call("POST", "/api/join", { code });
+          token = r.token;
+          LS.set("goorm.token", token);
+          store.uid = r.userId;
+          store.admin = !!r.admin;
           return true;
         } catch (e) {
-          if (e && e.code === "permission-denied") return false;
+          if (e.code === "permission-denied") return false;
           throw e;
         }
       },
-      onPosts(cb, err) {
-        fs.onSnapshot(fs.query(postsCol, fs.orderBy("createdAt", "desc"), fs.limit(500)), (s) => cb(s.docs.map(read)), err);
-      },
-      onComments(cb) {
-        fs.onSnapshot(fs.collectionGroup(db, "comments"), (s) => cb(s.docs.map(read)), () => {});
-      },
-      onSettings(cb) {
-        fs.onSnapshot(fs.doc(db, "settings", "class"), (s) => cb(s.exists() ? s.data() : {}), () => {});
-      },
-      async addPost(p) {
-        const ref = await fs.addDoc(postsCol, { ...p, authorId: me, createdAt: fs.serverTimestamp(), likes: {} });
-        return ref.id;
-      },
-      async editPost(id, p) {
-        await fs.updateDoc(fs.doc(db, "posts", id), { ...p, editedAt: fs.serverTimestamp() });
-      },
-      async like(id, on) {
-        await fs.updateDoc(fs.doc(db, "posts", id), { ["likes." + me]: on });
-      },
-      async removePost(id) {
-        const cs = await fs.getDocs(fs.collection(db, "posts", id, "comments"));
-        await Promise.all(cs.docs.map((d) => fs.deleteDoc(d.ref)));
-        await fs.deleteDoc(fs.doc(db, "posts", id));
-      },
-      async addComment(pid, c) {
-        await fs.addDoc(fs.collection(db, "posts", pid, "comments"), { ...c, postId: pid, authorId: me, createdAt: fs.serverTimestamp() });
-      },
-      async removeComment(pid, cid) {
-        await fs.deleteDoc(fs.doc(db, "posts", pid, "comments", cid));
-      },
-      async setSettings(s) {
-        await fs.setDoc(fs.doc(db, "settings", "class"), s);
-      },
+      onPosts(cb, err) { subs.posts.push(cb); subs.err = err; startPolling(); },
+      onComments(cb) { subs.comments.push(cb); startPolling(); },
+      onSettings(cb) { subs.settings.push(cb); startPolling(); },
+      async addPost(p) { return (await write("POST", "/api/posts", p)).id; },
+      async editPost(id, p) { await write("PATCH", "/api/posts/" + encodeURIComponent(id), p); },
+      async like(id, on) { await write("POST", "/api/posts/" + encodeURIComponent(id) + "/like", { on }); },
+      async removePost(id) { await write("DELETE", "/api/posts/" + encodeURIComponent(id)); },
+      async addComment(pid, c) { await write("POST", "/api/posts/" + encodeURIComponent(pid) + "/comments", c); },
+      async removeComment(pid, cid) { await write("DELETE", "/api/comments/" + encodeURIComponent(cid)); },
+      async setSettings(s) { await write("PUT", "/api/settings", s); },
       async claimAdmin(code) {
         try {
-          await fs.setDoc(fs.doc(db, "admins", me), { code });
+          await call("POST", "/api/admin", { code });
           store.admin = true;
           return true;
         } catch (e) {
-          if (e && e.code === "permission-denied") return false;
+          if (e.code === "permission-denied") return false;
           throw e;
         }
       },
@@ -264,7 +281,7 @@
     const main = $("#main");
     main.dataset.view = "list";
     main.innerHTML = `
-      ${S.mode === "local" ? `<p class="banner">지금은 이 기기에만 글이 저장되는 연습 모드예요. firebase-config.js에 Firebase 설정을 넣으면 반 친구들과 함께 쓸 수 있어요.</p>` : ""}
+      ${S.mode === "local" ? `<p class="banner">지금은 이 기기에만 글이 저장되는 연습 모드예요. config.js에 게시판 서버 주소를 넣으면 반 친구들과 함께 쓸 수 있어요.</p>` : ""}
       <div class="toolbar">
         <div class="tabs" role="tablist" aria-label="말머리">
           <button class="tab" role="tab" data-cat="all">전체<span class="n"></span></button>
@@ -631,17 +648,13 @@
   }
   async function boot() {
     S.nick = str(LS.get("goorm.nick", ""), 12);
-    const cfg = window.GOORM_FIREBASE_CONFIG;
+    const api = window.GOORM_API;
     let store;
-    if (cfg && cfg.apiKey && cfg.projectId) {
+    if (typeof api === "string" && api) {
       try {
-        store = await firebaseStore(cfg);
+        store = await apiStore(api);
       } catch (e) {
-        const code = (e && e.code) || String(e);
-        const hint = /operation-not-allowed|admin-restricted/.test(code)
-          ? "Firebase 콘솔의 Authentication에서 '익명' 로그인을 켜 주세요."
-          : "인터넷 연결과 firebase-config.js 설정을 확인해 주세요.";
-        showFail("게시판 서버에 연결하지 못했어요", hint, code);
+        showFail("게시판 서버에 연결하지 못했어요", "인터넷 연결을 확인하고 페이지를 새로 고쳐 주세요.", (e && e.code) || String(e));
         return;
       }
     } else {
@@ -670,9 +683,17 @@
       err.textContent = "";
       let ok = false;
       try { ok = await STORE.join(code); }
-      catch (e2) { err.textContent = "확인하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요."; btn.disabled = false; return; }
+      catch (e2) {
+        err.textContent = e2 && e2.code === "rate-limited"
+          ? "코드를 너무 많이 틀렸어요. 10분 뒤에 다시 시도해 주세요."
+          : "확인하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.";
+        btn.disabled = false;
+        return;
+      }
       btn.disabled = false;
       if (!ok) { err.textContent = "초대코드가 맞지 않아요. 선생님이나 반장에게 다시 물어봐 주세요."; input.select(); return; }
+      S.meId = STORE.uid;
+      S.admin = STORE.admin;
       gate.hidden = true;
       document.body.classList.remove("locked");
       toast("구름닷컴에 들어왔어요.");
@@ -689,7 +710,7 @@
     store.onComments((list) => { S.comments = list; gotComments = true; ready(); });
     store.onPosts(
       (list) => { S.posts = list; gotPosts = true; ready(); },
-      (e) => showFail("글 목록을 불러오지 못했어요", "Firestore 보안 규칙(firestore.rules)을 붙여 넣었는지 확인해 주세요.", e && e.code)
+      (e) => showFail("글 목록을 불러오지 못했어요", "인터넷 연결을 확인하고 페이지를 새로 고쳐 주세요.", e && e.code)
     );
   }
   renderHeader();
